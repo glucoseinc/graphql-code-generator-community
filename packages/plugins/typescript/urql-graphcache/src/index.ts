@@ -136,7 +136,7 @@ function getKeysConfig(
       })}>) => null | string`,
     );
     return keys;
-  }, []);
+  }, [] as string[]);
 
   return 'export type GraphCacheKeysConfig = {\n  ' + keys.join(',\n  ') + '\n}';
 }
@@ -149,6 +149,8 @@ function getResolversConfig(
   const objectTypes = [schema.getQueryType(), ...getObjectTypes(schema)];
 
   const resolvers = objectTypes.reduce((resolvers, parentType) => {
+    if (parentType == null) return [];
+
     const fields = Object.entries(parentType.getFields()).reduce((fields, [fieldName, field]) => {
       const args = Object.entries(field.args);
       const argsName = args.length
@@ -167,12 +169,12 @@ function getResolversConfig(
       );
 
       return fields;
-    }, []);
+    }, [] as string[]);
 
     resolvers.push(`  ${parentType.name}?: {\n    ` + fields.join(',\n    ') + '\n  }');
 
     return resolvers;
-  }, []);
+  }, [] as string[]);
 
   return resolvers;
 }
@@ -231,12 +233,12 @@ function getRootUpdatersConfig(
       );
 
       return fields;
-    }, []);
+    }, [] as string[]);
 
     resolvers.push(`  ${parentType.name}?: {\n    ` + fields.join(',\n    ') + '\n  }');
 
     return resolvers;
-  }, []);
+  }, [] as string[]);
 
   return {
     queryUpdaters,
