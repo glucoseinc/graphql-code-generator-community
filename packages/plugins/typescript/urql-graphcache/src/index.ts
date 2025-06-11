@@ -4,6 +4,7 @@ import {
   GraphQLSchema,
   GraphQLType,
   GraphQLWrappingType,
+  InlineFragmentNode,
   isEnumType,
   isInputObjectType,
   isInterfaceType,
@@ -263,6 +264,161 @@ const EMPTY_SELECTION_SET: SelectionSetNode = {
 };
 
 /**
+ * GraphQLドキュメントからFragment定義を収集します。
+ */
+function collectFragmentDefinitions(
+  documents: Types.DocumentFile[],
+): Map<string, FragmentDefinitionNode> {
+  const fragments = new Map<string, FragmentDefinitionNode>();
+
+  documents.forEach(doc => {
+    if (!doc.document) return;
+
+    visit(doc.document, {
+      FragmentDefinition(node) {
+        fragments.set(node.name.value, node);
+      },
+    });
+  });
+
+  return fragments;
+}
+
+/**
+ * 選択セット内の重複フィールドを統合します。
+ * 同じ名前のフィールドが複数ある場合、最初の1つだけを残します。
+ * ネストした選択セットがある場合は、それらもマージされます。
+ */
+function deduplicateFields(
+  selections: Array<SelectionSetNode['selections'][0]>,
+): Array<SelectionSetNode['selections'][0]> {
+  const fieldMap = new Map<string, SelectionSetNode['selections'][0]>();
+  const nonFieldSelections: Array<SelectionSetNode['selections'][0]> = [];
+
+  selections.forEach(selection => {
+    if (selection.kind === 'Field') {
+      const fieldName = selection.name.value;
+      const existingField = fieldMap.get(fieldName);
+
+      if (existingField && existingField.kind === 'Field') {
+        // 既存のフィールドがある場合、選択セットをマージ
+        if (selection.selectionSet && existingField.selectionSet) {
+          const mergedSelections = [
+            ...existingField.selectionSet.selections,
+            ...selection.selectionSet.selections,
+          ];
+          const deduplicatedMerged = deduplicateFields(mergedSelections);
+
+          fieldMap.set(fieldName, {
+            ...existingField,
+            selectionSet: {
+              ...existingField.selectionSet,
+              selections: deduplicatedMerged,
+            },
+          });
+        } else if (selection.selectionSet && !existingField.selectionSet) {
+          // 新しいフィールドに選択セットがあり、既存のフィールドにない場合
+          fieldMap.set(fieldName, selection);
+        }
+        // それ以外の場合は既存のフィールドを保持
+      } else {
+        // 新しいフィールドの場合
+        fieldMap.set(fieldName, selection);
+      }
+    } else {
+      // Field以外の選択（InlineFragmentなど）はそのまま保持
+      nonFieldSelections.push(selection);
+    }
+  });
+
+  return [...Array.from(fieldMap.values()), ...nonFieldSelections];
+}
+
+/**
+ * 選択セットを展開し、Fragment spreadとインラインFragmentを解決します。
+ * インラインFragmentの場合、型条件情報も保持します。
+ */
+function expandSelectionSet(
+  selectionSet: SelectionSetNode,
+  fragments: Map<string, FragmentDefinitionNode>,
+  schema: GraphQLSchema,
+  parentTypeName?: string,
+  visitedFragments: Set<string> = new Set(),
+): SelectionSetNode {
+  const expandedSelections: Array<(typeof selectionSet.selections)[0]> = [];
+
+  selectionSet.selections.forEach(selection => {
+    switch (selection.kind) {
+      case 'Field': {
+        if (selection.selectionSet) {
+          // ネストした選択セットも再帰的に展開
+          expandedSelections.push({
+            ...selection,
+            selectionSet: expandSelectionSet(
+              selection.selectionSet,
+              fragments,
+              schema,
+              parentTypeName,
+              visitedFragments,
+            ),
+          });
+        } else {
+          expandedSelections.push(selection);
+        }
+        break;
+      }
+      case 'FragmentSpread': {
+        // 循環参照をチェック
+        if (visitedFragments.has(selection.name.value)) {
+          // 循環参照が検出された場合は、Fragmentの展開を停止
+          break;
+        }
+
+        // Fragment spreadを展開
+        const fragmentDef = fragments.get(selection.name.value);
+        if (fragmentDef) {
+          const newVisitedFragments = new Set(visitedFragments);
+          newVisitedFragments.add(selection.name.value);
+
+          const expandedFragment = expandSelectionSet(
+            fragmentDef.selectionSet,
+            fragments,
+            schema,
+            parentTypeName,
+            newVisitedFragments,
+          );
+          expandedSelections.push(...expandedFragment.selections);
+        }
+        break;
+      }
+      case 'InlineFragment': {
+        // インラインFragmentはそのまま保持（型条件情報を失わないため）
+        const expandedInlineFragment = expandSelectionSet(
+          selection.selectionSet,
+          fragments,
+          schema,
+          selection.typeCondition?.name.value,
+          visitedFragments,
+        );
+        expandedSelections.push({
+          ...selection,
+          selectionSet: expandedInlineFragment,
+        });
+        break;
+      }
+    }
+  });
+
+  // 重複フィールドを統合
+  const deduplicatedSelections = deduplicateFields(expandedSelections);
+
+  return {
+    ...selectionSet,
+    selections: deduplicatedSelections,
+  };
+}
+
+/**
  * 選択セット内のフィールドを正規化します。
  * フィールドをスキーマ定義順でソートすることで、選択順序が異なっても同じ型として認識できるようにします。
  */
@@ -400,8 +556,12 @@ function getSelectionSetKey(
  */
 function extractMutationSelections(
   documents: Types.DocumentFile[],
+  schema: GraphQLSchema,
 ): Map<string, MutationFieldSelection> {
   const mutationSelections = new Map<string, MutationFieldSelection>();
+
+  // Fragment定義を収集
+  const fragments = collectFragmentDefinitions(documents);
 
   documents.forEach(doc => {
     if (!doc.document) return;
@@ -414,7 +574,10 @@ function extractMutationSelections(
           .filter(selection => selection.kind === 'Field')
           .forEach(selection => {
             const mutationName = selection.name.value;
-            const currentSelectionSet = selection.selectionSet ?? EMPTY_SELECTION_SET;
+            let currentSelectionSet = selection.selectionSet ?? EMPTY_SELECTION_SET;
+
+            // Fragment展開を適用
+            currentSelectionSet = expandSelectionSet(currentSelectionSet, fragments, schema);
 
             const existing = mutationSelections.get(mutationName);
 
@@ -447,12 +610,31 @@ function buildOptimisticReturnType(
     return baseTypeName;
   }
 
+  // インラインFragmentが含まれている場合は、別の処理が必要
+  const hasInlineFragments = selectionSet.selections.some(
+    selection => selection.kind === 'InlineFragment',
+  );
+
+  if (hasInlineFragments) {
+    return buildOptimisticReturnTypeWithInlineFragments(
+      selectionSet,
+      baseTypeName,
+      schema,
+      convertName,
+      config,
+    );
+  }
+
   // 選択セットを正規化（フィールドをスキーマ定義順でソート）
   const normalizedSelectionSet = normalizeSelectionSet(selectionSet, schema, baseTypeName);
   const selectedFields: string[] = [];
 
-  // GraphCacheでは常に__typenameが必要なので最初に追加
-  selectedFields.push('__typename: string');
+  // 実際の型名を取得してリテラル型として使用
+  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const literalTypeName = cleanTypeName.split(/TypeSuffix|Suffix$/)[0].replace(/^Prefix/, ''); // prefixとsuffixを除去
+
+  // GraphCacheでは常に__typenameが必要なので最初に追加（リテラル型として）
+  selectedFields.push(`__typename: '${literalTypeName}'`);
 
   normalizedSelectionSet.selections.forEach(selection => {
     if (selection.kind === 'Field') {
@@ -469,14 +651,26 @@ function buildOptimisticReturnType(
       if (baseType && isObjectType(baseType)) {
         const field = baseType.getFields()[fieldName];
         if (field) {
-          const fieldType = constructType(field.type, schema, convertName, config, false);
-
           // ネストした選択がある場合は再帰的に処理
           if (selection.selectionSet) {
             let unwrappedType = field.type;
-            // GraphQLの型をアンラップして実際の型を取得
-            while (isNonNullType(unwrappedType) || isListType(unwrappedType)) {
+            let isNullable = true;
+            let isArray = false;
+
+            // GraphQLの型をアンラップして、リスト型とNonNull型の情報を保持
+            if (isNonNullType(unwrappedType)) {
+              isNullable = false;
               unwrappedType = unwrappedType.ofType;
+            }
+
+            if (isListType(unwrappedType)) {
+              isArray = true;
+              unwrappedType = unwrappedType.ofType;
+
+              // リスト内の要素のNonNull情報も確認
+              if (isNonNullType(unwrappedType)) {
+                unwrappedType = unwrappedType.ofType;
+              }
             }
 
             if (isObjectType(unwrappedType)) {
@@ -491,11 +685,39 @@ function buildOptimisticReturnType(
                 convertName,
                 config,
               );
-              selectedFields.push(`${fieldName}: ${optimizedNestedType}`);
+
+              // リスト型の包装を適用
+              let finalType = optimizedNestedType;
+              if (isArray) {
+                finalType = `Array<${finalType}>`;
+              }
+              if (isNullable) {
+                finalType = `Maybe<${finalType}>`;
+              }
+
+              selectedFields.push(`${fieldName}: ${finalType}`);
             } else {
+              // オブジェクト型ではない場合は通常の型生成を使用
+              const fieldType = constructType(
+                field.type,
+                schema,
+                convertName,
+                config,
+                true, // nullableを正しく判定させる
+                false,
+              );
               selectedFields.push(`${fieldName}: ${fieldType}`);
             }
           } else {
+            // 選択セットがない場合は通常の型生成を使用
+            const fieldType = constructType(
+              field.type,
+              schema,
+              convertName,
+              config,
+              true, // nullableを正しく判定させる
+              false,
+            );
             selectedFields.push(`${fieldName}: ${fieldType}`);
           }
         }
@@ -508,6 +730,134 @@ function buildOptimisticReturnType(
   }
 
   return `{ ${selectedFields.join(', ')} }`;
+}
+
+/**
+ * インラインFragmentを含む選択セットから最適化された型を生成します。
+ */
+function buildOptimisticReturnTypeWithInlineFragments(
+  selectionSet: SelectionSetNode,
+  baseTypeName: string,
+  schema: GraphQLSchema,
+  convertName: ConvertFn,
+  config: UrqlGraphCacheConfig,
+): string {
+  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const baseType = schema.getType(cleanTypeName);
+
+  if (!baseType || (!isInterfaceType(baseType) && !isUnionType(baseType))) {
+    // インターフェース型やユニオン型でない場合は、インラインFragmentを無視して通常のフィールドのみ処理
+    const normalSelections = selectionSet.selections.filter(
+      selection => selection.kind === 'Field',
+    );
+    const normalSelectionSet: SelectionSetNode = {
+      ...selectionSet,
+      selections: normalSelections,
+    };
+
+    // 無限再帰を避けるために、直接フィールド処理を行う
+    const selectedFields: string[] = [`__typename: '${cleanTypeName}'`];
+
+    normalSelectionSet.selections.forEach(selection => {
+      if (selection.kind === 'Field' && selection.name.value !== '__typename') {
+        const fieldName = selection.name.value;
+
+        if (isObjectType(baseType)) {
+          const field = baseType.getFields()[fieldName];
+          if (field) {
+            const fieldType = constructType(
+              field.type,
+              schema,
+              convertName,
+              config,
+              true,
+              false,
+            );
+            selectedFields.push(`${fieldName}: ${fieldType}`);
+          }
+        }
+      }
+    });
+
+    return `{ ${selectedFields.join(', ')} }`;
+  }
+
+  // 共通フィールドを収集
+  const commonFields: { name: string; type: string }[] = [];
+  selectionSet.selections.forEach(selection => {
+    if (selection.kind === 'Field') {
+      const fieldName = selection.name.value;
+      if (fieldName === '__typename') return;
+
+      // インターフェース型の場合のみ共通フィールドを処理
+      if (isInterfaceType(baseType)) {
+        const field = baseType.getFields()[fieldName];
+        if (field) {
+          const fieldType = constructType(
+            field.type,
+            schema,
+            convertName,
+            config,
+            true,
+            false,
+          );
+          commonFields.push({ name: fieldName, type: fieldType });
+        }
+      }
+    }
+  });
+
+  // インラインFragmentごとに具体的な型を生成
+  const inlineFragments = selectionSet.selections.filter(
+    selection => selection.kind === 'InlineFragment',
+  ) as InlineFragmentNode[];
+  const typeSpecificVariants: string[] = [];
+
+  for (const inlineFragment of inlineFragments) {
+    if (inlineFragment.typeCondition) {
+      const typeName = inlineFragment.typeCondition.name.value;
+      const concreteType = schema.getType(typeName);
+
+      if (concreteType && isObjectType(concreteType)) {
+        const typeFields: string[] = [];
+        typeFields.push(`__typename: '${typeName}'`);
+
+        // 共通フィールドを追加
+        commonFields.forEach(field => {
+          typeFields.push(`${field.name}: ${field.type}`);
+        });
+
+        // インラインFragment内のフィールドを追加
+        inlineFragment.selectionSet.selections.forEach(selection => {
+          if (selection.kind === 'Field') {
+            const fieldName = selection.name.value;
+            if (fieldName === '__typename') return;
+
+            const field = concreteType.getFields()[fieldName];
+            if (field) {
+              const fieldType = constructType(
+                field.type,
+                schema,
+                convertName,
+                config,
+                true,
+                false,
+              );
+              typeFields.push(`${fieldName}: ${fieldType}`);
+            }
+          }
+        });
+
+        typeSpecificVariants.push(`{ ${typeFields.join(', ')} }`);
+      }
+    }
+  }
+
+  if (typeSpecificVariants.length === 0) {
+    return baseTypeName;
+  }
+
+  return typeSpecificVariants.join(' | ');
 }
 
 function buildOptimisticUnionType(
@@ -560,7 +910,7 @@ function getOptimisticUpdatersConfig(
 
   // 型の最適化が有効な場合のみMutation選択セットを抽出
   const mutationSelections = config.optimizeOptimisticTypes
-    ? extractMutationSelections(documents)
+    ? extractMutationSelections(documents, schema)
     : new Map<string, MutationFieldSelection>();
 
   // すべてのMutationフィールドを処理
@@ -585,7 +935,11 @@ function getOptimisticUpdatersConfig(
           unwrappedType = unwrappedType.ofType;
         }
 
-        if (isObjectType(unwrappedType)) {
+        if (
+          isObjectType(unwrappedType) ||
+          isInterfaceType(unwrappedType) ||
+          isUnionType(unwrappedType)
+        ) {
           const baseTypeName = convertName(unwrappedType.name, {
             prefix: config.typesPrefix,
             suffix: config.typesSuffix,
