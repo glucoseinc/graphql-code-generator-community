@@ -1,4 +1,5 @@
 import {
+  FieldNode,
   GraphQLObjectType,
   GraphQLSchema,
   GraphQLType,
@@ -12,7 +13,10 @@ import {
   isScalarType,
   isUnionType,
   isWrappingType,
+  Kind,
+  SelectionSetNode,
   TypeNode,
+  visit,
 } from 'graphql';
 import { PluginFunction, Types } from '@graphql-codegen/plugin-helpers';
 import { convertFactory, ConvertFn } from '@graphql-codegen/visitor-plugin-common';
@@ -248,33 +252,375 @@ function getRootUpdatersConfig(
   };
 }
 
+interface MutationFieldSelection {
+  mutationName: string;
+  selectionSets: SelectionSetNode[];
+}
+
+const EMPTY_SELECTION_SET: SelectionSetNode = {
+  kind: Kind.SELECTION_SET,
+  selections: [],
+};
+
+/**
+ * 選択セット内のフィールドを正規化します。
+ * フィールドをスキーマ定義順でソートすることで、選択順序が異なっても同じ型として認識できるようにします。
+ */
+function normalizeSelectionSet(
+  selectionSet: SelectionSetNode,
+  schema: GraphQLSchema,
+  baseTypeName: string,
+): SelectionSetNode {
+  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const baseType = schema.getType(cleanTypeName);
+
+  if (!baseType || !isObjectType(baseType)) {
+    return selectionSet;
+  }
+
+  const schemaFields = baseType.getFields();
+  const fieldOrder = Object.keys(schemaFields);
+
+  const normalizedSelections = [...selectionSet.selections]
+    .filter(selection => selection.kind === 'Field')
+    .sort((a, b) => {
+      if (a.kind !== 'Field' || b.kind !== 'Field') return 0;
+
+      const aIndex = fieldOrder.indexOf(a.name.value);
+      const bIndex = fieldOrder.indexOf(b.name.value);
+
+      // スキーマに定義されていないフィールドは末尾に
+      if (aIndex === -1 && bIndex === -1) return 0;
+      if (aIndex === -1) return 1;
+      if (bIndex === -1) return -1;
+
+      return aIndex - bIndex;
+    })
+    .map(selection => {
+      if (selection.kind === 'Field' && selection.selectionSet) {
+        // ネストした選択セットも再帰的に正規化
+        let nestedTypeName = baseTypeName;
+        const field = schemaFields[selection.name.value];
+        if (field) {
+          let unwrappedType = field.type;
+          while (isNonNullType(unwrappedType) || isListType(unwrappedType)) {
+            unwrappedType = unwrappedType.ofType;
+          }
+          if (isObjectType(unwrappedType)) {
+            nestedTypeName = unwrappedType.name;
+          }
+        }
+
+        return {
+          ...selection,
+          selectionSet: normalizeSelectionSet(selection.selectionSet, schema, nestedTypeName),
+        };
+      }
+      return selection;
+    });
+
+  return {
+    ...selectionSet,
+    selections: normalizedSelections,
+  };
+}
+
+/**
+ * 選択セットから正規化されたキーを生成します。
+ * このキーは選択フィールドの構造を表し、順序に依存しません。
+ */
+function getSelectionSetKey(
+  selectionSet: SelectionSetNode,
+  schema: GraphQLSchema,
+  baseTypeName: string,
+): string {
+  const normalizedSet = normalizeSelectionSet(selectionSet, schema, baseTypeName);
+
+  const fieldKeys = normalizedSet.selections
+    .filter(selection => selection.kind === 'Field')
+    .map(selection => {
+      if (selection.kind !== 'Field') return '';
+
+      const fieldName = selection.name.value;
+      if (selection.selectionSet) {
+        // ネストした型名を取得
+        const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+        const baseType = schema.getType(cleanTypeName);
+        let nestedTypeName = baseTypeName;
+
+        if (baseType && isObjectType(baseType)) {
+          const field = baseType.getFields()[fieldName];
+          if (field) {
+            let unwrappedType = field.type;
+            while (isNonNullType(unwrappedType) || isListType(unwrappedType)) {
+              unwrappedType = unwrappedType.ofType;
+            }
+            if (isObjectType(unwrappedType)) {
+              nestedTypeName = unwrappedType.name;
+            }
+          }
+        }
+
+        const nestedKey = getSelectionSetKey(selection.selectionSet, schema, nestedTypeName);
+        return `${fieldName}{${nestedKey}}`;
+      }
+      return fieldName;
+    })
+    .join(',');
+
+  return fieldKeys;
+}
+
+/**
+ * GraphQLドキュメントからMutationの選択セットを抽出します。
+ *
+ * この関数は、プロジェクト内で使用されているすべてのMutationオペレーションを解析し、
+ * 各Mutationフィールドで実際に選択されているフィールド（selectionSet）を取得します。
+ * 同じMutationに対して複数の異なる選択セットがある場合、それらを配列として保持します。
+ *
+ * @example
+ * ```graphql
+ * mutation UpdateUserMutation($id: ID!, $name: String!) {
+ *   updateUser(id: $id, name: $name) {
+ *     id
+ *     name
+ *     profile {
+ *       bio
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * 上記のクエリからは以下の情報が抽出されます：
+ * - mutationName: "updateUser"
+ * - selectionSets: [{ id, name, profile { bio } }] の構造
+ *
+ * @param documents - GraphQL Code Generatorから渡されるドキュメントファイルの配列
+ * @returns Mutationフィールド名をキーとし、そのMutationの選択情報を値とするMap
+ */
+function extractMutationSelections(
+  documents: Types.DocumentFile[],
+): Map<string, MutationFieldSelection> {
+  const mutationSelections = new Map<string, MutationFieldSelection>();
+
+  documents.forEach(doc => {
+    if (!doc.document) return;
+
+    visit(doc.document, {
+      OperationDefinition(node) {
+        if (node.operation !== 'mutation') return;
+
+        node.selectionSet.selections
+          .filter(selection => selection.kind === 'Field')
+          .forEach(selection => {
+            const mutationName = selection.name.value;
+            const currentSelectionSet = selection.selectionSet ?? EMPTY_SELECTION_SET;
+
+            const existing = mutationSelections.get(mutationName);
+
+            if (existing) {
+              // 既存のMutationに新しい選択セットを追加
+              existing.selectionSets.push(currentSelectionSet);
+            } else {
+              // 新しいMutationを追加
+              mutationSelections.set(mutationName, {
+                mutationName,
+                selectionSets: [currentSelectionSet],
+              });
+            }
+          });
+      },
+    });
+  });
+
+  return mutationSelections;
+}
+
+function buildOptimisticReturnType(
+  selectionSet: SelectionSetNode,
+  baseTypeName: string,
+  schema: GraphQLSchema,
+  convertName: ConvertFn,
+  config: UrqlGraphCacheConfig,
+): string {
+  if (selectionSet.selections.length === 0) {
+    return baseTypeName;
+  }
+
+  // 選択セットを正規化（フィールドをスキーマ定義順でソート）
+  const normalizedSelectionSet = normalizeSelectionSet(selectionSet, schema, baseTypeName);
+  const selectedFields: string[] = [];
+
+  // GraphCacheでは常に__typenameが必要なので最初に追加
+  selectedFields.push('__typename: string');
+
+  normalizedSelectionSet.selections.forEach(selection => {
+    if (selection.kind === 'Field') {
+      const fieldName = selection.name.value;
+
+      // __typenameは既に追加済みなのでスキップ
+      if (fieldName === '__typename') {
+        return;
+      }
+
+      // フィールドの型情報を取得
+      const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+      const baseType = schema.getType(cleanTypeName);
+      if (baseType && isObjectType(baseType)) {
+        const field = baseType.getFields()[fieldName];
+        if (field) {
+          const fieldType = constructType(field.type, schema, convertName, config, false);
+
+          // ネストした選択がある場合は再帰的に処理
+          if (selection.selectionSet) {
+            let unwrappedType = field.type;
+            // GraphQLの型をアンラップして実際の型を取得
+            while (isNonNullType(unwrappedType) || isListType(unwrappedType)) {
+              unwrappedType = unwrappedType.ofType;
+            }
+
+            if (isObjectType(unwrappedType)) {
+              const nestedTypeName = convertName(unwrappedType.name, {
+                prefix: config.typesPrefix,
+                suffix: config.typesSuffix,
+              });
+              const optimizedNestedType = buildOptimisticReturnType(
+                selection.selectionSet,
+                `WithTypename<${nestedTypeName}>`,
+                schema,
+                convertName,
+                config,
+              );
+              selectedFields.push(`${fieldName}: ${optimizedNestedType}`);
+            } else {
+              selectedFields.push(`${fieldName}: ${fieldType}`);
+            }
+          } else {
+            selectedFields.push(`${fieldName}: ${fieldType}`);
+          }
+        }
+      }
+    }
+  });
+
+  if (selectedFields.length === 0) {
+    return baseTypeName;
+  }
+
+  return `{ ${selectedFields.join(', ')} }`;
+}
+
+function buildOptimisticUnionType(
+  selectionSets: SelectionSetNode[],
+  baseTypeName: string,
+  schema: GraphQLSchema,
+  convertName: ConvertFn,
+  config: UrqlGraphCacheConfig,
+): string {
+  if (selectionSets.length === 0) {
+    return baseTypeName;
+  }
+
+  if (selectionSets.length === 1) {
+    return buildOptimisticReturnType(selectionSets[0], baseTypeName, schema, convertName, config);
+  }
+
+  // 正規化されたキーを使用して重複する選択セットを除去
+  const uniqueSelectionSets = new Map<string, SelectionSetNode>();
+
+  selectionSets.forEach(selectionSet => {
+    const key = getSelectionSetKey(selectionSet, schema, baseTypeName);
+    if (!uniqueSelectionSets.has(key)) {
+      uniqueSelectionSets.set(key, selectionSet);
+    }
+  });
+
+  // 一意な選択セットから型を生成
+  const types = Array.from(uniqueSelectionSets.values()).map(selectionSet =>
+    buildOptimisticReturnType(selectionSet, baseTypeName, schema, convertName, config),
+  );
+
+  if (types.length === 1) {
+    return types[0];
+  }
+
+  return types.map(type => `| ${type}`).join(' ');
+}
+
 function getOptimisticUpdatersConfig(
   schema: GraphQLSchema,
+  documents: Types.DocumentFile[],
   convertName: ConvertFn,
   config: UrqlGraphCacheConfig,
 ): string[] | null {
   const mutationType = schema.getMutationType();
-  if (mutationType) {
-    const optimistic: string[] = [];
+  if (!mutationType) return null;
 
-    Object.values(mutationType.getFields()).forEach(field => {
-      const argsName = field.args.length
-        ? convertName(`${capitalize(mutationType.name)}${capitalize(field.name)}Args`, {
+  const optimistic: string[] = [];
+
+  // 型の最適化が有効な場合のみMutation選択セットを抽出
+  const mutationSelections = config.optimizeOptimisticTypes
+    ? extractMutationSelections(documents)
+    : new Map<string, MutationFieldSelection>();
+
+  // すべてのMutationフィールドを処理
+  Object.values(mutationType.getFields()).forEach(field => {
+    const argsName = field.args.length
+      ? convertName(`${capitalize(mutationType.name)}${capitalize(field.name)}Args`, {
+          prefix: config.typesPrefix,
+          suffix: config.typesSuffix,
+        })
+      : 'Record<string, never>';
+
+    let outputType = constructType(field.type, schema, convertName, config);
+
+    // 型の最適化が有効で、選択情報がある場合
+    if (config.optimizeOptimisticTypes) {
+      const selection = mutationSelections.get(field.name);
+
+      if (selection && selection.selectionSets.length > 0) {
+        let unwrappedType = field.type;
+        // GraphQLの型をアンラップして実際の型を取得
+        while (isNonNullType(unwrappedType) || isListType(unwrappedType)) {
+          unwrappedType = unwrappedType.ofType;
+        }
+
+        if (isObjectType(unwrappedType)) {
+          const baseTypeName = convertName(unwrappedType.name, {
             prefix: config.typesPrefix,
             suffix: config.typesSuffix,
-          })
-        : 'Record<string, never>';
-      const outputType = constructType(field.type, schema, convertName, config);
-      optimistic.push(
-        `${field.name}?: GraphCacheOptimisticMutationResolver<` +
-          `${argsName}, ` +
-          `${outputType}>`,
-      );
-    });
+          });
 
-    return optimistic;
-  }
-  return null;
+          const partialType = buildOptimisticUnionType(
+            selection.selectionSets,
+            `WithTypename<${baseTypeName}>`,
+            schema,
+            convertName,
+            config,
+          );
+
+          // NonNullやListの包装を維持
+          if (isNonNullType(field.type)) {
+            if (isListType(field.type.ofType)) {
+              outputType = `Array<${partialType}>`;
+            } else {
+              outputType = partialType;
+            }
+          } else if (isListType(field.type)) {
+            outputType = `Maybe<Array<${partialType}>>`;
+          } else {
+            outputType = `Maybe<${partialType}>`;
+          }
+        }
+      }
+    }
+
+    optimistic.push(
+      `${field.name}?: GraphCacheOptimisticMutationResolver<` + `${argsName}, ` + `${outputType}>`,
+    );
+  });
+
+  return optimistic.length > 0 ? optimistic : null;
 }
 
 function getImports(config: UrqlGraphCacheConfig): string {
@@ -290,7 +636,7 @@ function getImports(config: UrqlGraphCacheConfig): string {
 
 export const plugin: PluginFunction<UrqlGraphCacheConfig, Types.ComplexPluginOutput> = (
   schema: GraphQLSchema,
-  _documents,
+  documents,
   config,
 ) => {
   const convertName = convertFactory(config);
@@ -299,7 +645,7 @@ export const plugin: PluginFunction<UrqlGraphCacheConfig, Types.ComplexPluginOut
   const resolvers = getResolversConfig(schema, convertName, config);
   const { queryUpdaters, mutationUpdaters, subscriptionUpdaters, typeUpdateResolvers } =
     getRootUpdatersConfig(schema, convertName, config);
-  const optimisticUpdaters = getOptimisticUpdatersConfig(schema, convertName, config);
+  const optimisticUpdaters = getOptimisticUpdatersConfig(schema, documents, convertName, config);
 
   const queryType = schema.getQueryType();
   const mutationType = schema.getMutationType();
