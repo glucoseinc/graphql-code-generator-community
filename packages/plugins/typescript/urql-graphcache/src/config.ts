@@ -5,4 +5,9 @@ import { RawClientSideBasePluginConfig } from '@graphql-codegen/visitor-plugin-c
  */
 export type UrqlGraphCacheConfig = RawClientSideBasePluginConfig & {
   offlineExchange?: boolean;
+  /**
+   * @description Optimize optimistic updater types based on actual field selections in mutations
+   * @default false
+   */
+  optimizeOptimisticTypes?: boolean;
 };
