@@ -412,7 +412,7 @@ function extractMutationSelections(
 
         node.selectionSet.selections
           .filter(selection => selection.kind === 'Field')
-          .forEach(selection => {
+          .forEach((selection: FieldNode) => {
             const mutationName = selection.name.value;
             const currentSelectionSet = selection.selectionSet ?? EMPTY_SELECTION_SET;
 
