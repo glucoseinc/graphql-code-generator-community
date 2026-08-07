@@ -765,14 +765,7 @@ function buildOptimisticReturnTypeWithInlineFragments(
         if (isObjectType(baseType)) {
           const field = baseType.getFields()[fieldName];
           if (field) {
-            const fieldType = constructType(
-              field.type,
-              schema,
-              convertName,
-              config,
-              true,
-              false,
-            );
+            const fieldType = constructType(field.type, schema, convertName, config, true, false);
             selectedFields.push(`${fieldName}: ${fieldType}`);
           }
         }
@@ -793,14 +786,7 @@ function buildOptimisticReturnTypeWithInlineFragments(
       if (isInterfaceType(baseType)) {
         const field = baseType.getFields()[fieldName];
         if (field) {
-          const fieldType = constructType(
-            field.type,
-            schema,
-            convertName,
-            config,
-            true,
-            false,
-          );
+          const fieldType = constructType(field.type, schema, convertName, config, true, false);
           commonFields.push({ name: fieldName, type: fieldType });
         }
       }
@@ -835,14 +821,7 @@ function buildOptimisticReturnTypeWithInlineFragments(
 
             const field = concreteType.getFields()[fieldName];
             if (field) {
-              const fieldType = constructType(
-                field.type,
-                schema,
-                convertName,
-                config,
-                true,
-                false,
-              );
+              const fieldType = constructType(field.type, schema, convertName, config, true, false);
               typeFields.push(`${fieldName}: ${fieldType}`);
             }
           }
