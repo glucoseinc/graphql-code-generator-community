@@ -10,4 +10,8 @@ export type UrqlGraphCacheConfig = RawClientSideBasePluginConfig & {
    * @default false
    */
   optimizeOptimisticTypes?: boolean;
+  /**
+   * @description Module to import schema types (`Scalars`, `Maybe`, object types and field argument types) from, instead of expecting them in the same output file.
+   */
+  importSchemaTypesFrom?: string;
 };

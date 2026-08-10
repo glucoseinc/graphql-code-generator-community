@@ -1319,4 +1319,92 @@ import type { cacheExchange, Resolver as GraphCacheResolver, UpdateResolver as G
       "updateUser?: GraphCacheOptimisticMutationResolver<MutationUpdateUserArgs, { __typename: 'User', id: Scalars['ID']['output'], profile: Maybe<{ __typename: 'Profile', bio: Maybe<Scalars['String']['output']>, avatar: Maybe<Scalars['String']['output']> }> }>",
     );
   });
+
+  describe('importSchemaTypesFrom', () => {
+    const schema = buildSchema(/* GraphQL */ `
+      type Query {
+        todo(id: ID!): Todo
+        node(id: ID!): Node
+      }
+
+      type Mutation {
+        toggleTodo(id: ID!): Todo!
+      }
+
+      interface Node {
+        id: ID!
+      }
+
+      type Todo implements Node {
+        id: ID!
+        text: String
+        state: TodoState
+      }
+
+      enum TodoState {
+        OPEN
+        DONE
+      }
+    `);
+
+    const documents = [
+      {
+        location: 'test.graphql',
+        document: parse(/* GraphQL */ `
+          mutation ToggleTodo($id: ID!) {
+            toggleTodo(id: $id) {
+              id
+              text
+            }
+          }
+        `),
+      },
+    ];
+
+    it('Should import schema types from the given module and reference them through the namespace', async () => {
+      const result = await plugin(schema, documents, {
+        importSchemaTypesFrom: './schemaTypes',
+      });
+
+      expect(result.prepend?.join('')).toContain(
+        "import type * as SchemaTypes from './schemaTypes';",
+      );
+
+      expect(result.content).toContain(
+        'Todo?: (data: WithTypename<SchemaTypes.Todo>) => null | string',
+      );
+      expect(result.content).toContain(
+        "text?: GraphCacheResolver<WithTypename<SchemaTypes.Todo>, Record<string, never>, SchemaTypes.Scalars['String']['output'] | string>",
+      );
+      expect(result.content).toContain(
+        'todo?: GraphCacheUpdateResolver<{ todo: SchemaTypes.Maybe<WithTypename<SchemaTypes.Todo>> }, SchemaTypes.QueryTodoArgs>',
+      );
+      expect(result.content).toContain(
+        'toggleTodo?: GraphCacheOptimisticMutationResolver<SchemaTypes.MutationToggleTodoArgs',
+      );
+      expect(result.content).toContain('WithTypename<SchemaTypes.Todo>');
+    });
+
+    it('Should keep __typename literals free of the namespace', async () => {
+      const result = await plugin(schema, documents, {
+        importSchemaTypesFrom: './schemaTypes',
+        optimizeOptimisticTypes: true,
+      });
+
+      expect(result.content).toContain("{ __typename: 'Todo'");
+      expect(result.content).not.toContain("__typename: 'SchemaTypes.");
+    });
+
+    it('Should not change the output when the option is omitted', async () => {
+      const withOption = await plugin(schema, documents, {
+        importSchemaTypesFrom: './schemaTypes',
+        optimizeOptimisticTypes: true,
+      });
+      const withoutOption = await plugin(schema, documents, { optimizeOptimisticTypes: true });
+
+      expect(withoutOption.prepend?.join('')).not.toContain('SchemaTypes');
+      expect(withoutOption.content).not.toContain('SchemaTypes.');
+      expect(withOption.content.replaceAll('SchemaTypes.', '')).toBe(withoutOption.content);
+    });
+  });
 });

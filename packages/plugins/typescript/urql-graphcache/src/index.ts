@@ -25,6 +25,14 @@ import { UrqlGraphCacheConfig } from './config.js';
 
 type GraphQLFlatType = Exclude<TypeNode, GraphQLWrappingType>;
 
+const SCHEMA_TYPES_NAMESPACE = 'SchemaTypes';
+
+const namespaced = (config: UrqlGraphCacheConfig, typeName: string): string =>
+  config.importSchemaTypesFrom ? `${SCHEMA_TYPES_NAMESPACE}.${typeName}` : typeName;
+
+const denamespaced = (typeName: string): string =>
+  typeName.replace(new RegExp(`^${SCHEMA_TYPES_NAMESPACE}\\.`), '');
+
 const unwrapType = (type: null | undefined | TypeNode): GraphQLFlatType | null =>
   isWrappingType(type) ? unwrapType(type.ofType as any) : type || null;
 
@@ -70,9 +78,11 @@ function constructType(
   nullable = true,
   allowString = false,
 ): string {
+  const maybe = namespaced(config, 'Maybe');
+
   if (isListType(typeNode)) {
     return nullable
-      ? `Maybe<Array<${constructType(
+      ? `${maybe}<Array<${constructType(
           typeNode.ofType,
           schema,
           convertName,
@@ -89,38 +99,45 @@ function constructType(
 
   const type = schema.getType(typeNode.name);
   if (isScalarType(type)) {
+    const scalarType = `${namespaced(config, 'Scalars')}['${type.name}']['output']`;
     return nullable
-      ? `Maybe<Scalars['${type.name}']['output']${allowString ? ' | string' : ''}>`
-      : `Scalars['${type.name}']['output']${allowString ? ' | string' : ''}`;
+      ? `${maybe}<${scalarType}${allowString ? ' | string' : ''}>`
+      : `${scalarType}${allowString ? ' | string' : ''}`;
   }
 
-  const tsTypeName = convertName(typeNode.name, {
-    prefix: config.typesPrefix,
-    suffix: config.typesSuffix,
-  });
+  const tsTypeName = namespaced(
+    config,
+    convertName(typeNode.name, {
+      prefix: config.typesPrefix,
+      suffix: config.typesSuffix,
+    }),
+  );
 
   if (isUnionType(type) || isInputObjectType(type) || isObjectType(type)) {
     const finalType = `WithTypename<${tsTypeName}>${allowString ? ' | string' : ''}`;
-    return nullable ? `Maybe<${finalType}>` : finalType;
+    return nullable ? `${maybe}<${finalType}>` : finalType;
   }
 
   if (isEnumType(type)) {
     const finalType = `${tsTypeName}${allowString ? ' | string' : ''}`;
-    return nullable ? `Maybe<${finalType}>` : finalType;
+    return nullable ? `${maybe}<${finalType}>` : finalType;
   }
 
   if (isInterfaceType(type)) {
     const possibleTypes = schema.getPossibleTypes(type).map(possibleType => {
-      const tsPossibleTypeName = convertName(possibleType.name, {
-        prefix: config.typesPrefix,
-        suffix: config.typesSuffix,
-      });
+      const tsPossibleTypeName = namespaced(
+        config,
+        convertName(possibleType.name, {
+          prefix: config.typesPrefix,
+          suffix: config.typesSuffix,
+        }),
+      );
       return `WithTypename<${tsPossibleTypeName}>`;
     });
     const finalType = allowString
       ? possibleTypes.join(' | ') + ' | string'
       : possibleTypes.join(' | ');
-    return nullable ? `Maybe<${finalType}>` : finalType;
+    return nullable ? `${maybe}<${finalType}>` : finalType;
   }
 
   throw new Error(`Unhandled type ${type}`);
@@ -135,10 +152,13 @@ function getKeysConfig(
 ) {
   const keys = getObjectTypes(schema).reduce((keys, type) => {
     keys.push(
-      `${type.name}?: (data: WithTypename<${convertName(type.name, {
-        prefix: config.typesPrefix,
-        suffix: config.typesSuffix,
-      })}>) => null | string`,
+      `${type.name}?: (data: WithTypename<${namespaced(
+        config,
+        convertName(type.name, {
+          prefix: config.typesPrefix,
+          suffix: config.typesSuffix,
+        }),
+      )}>) => null | string`,
     );
     return keys;
   }, [] as string[]);
@@ -159,17 +179,23 @@ function getResolversConfig(
     const fields = Object.entries(parentType.getFields()).reduce((fields, [fieldName, field]) => {
       const args = Object.entries(field.args);
       const argsName = args.length
-        ? convertName(`${parentType.name}${capitalize(fieldName)}Args`, {
-            prefix: config.typesPrefix,
-            suffix: config.typesSuffix,
-          })
+        ? namespaced(
+            config,
+            convertName(`${parentType.name}${capitalize(fieldName)}Args`, {
+              prefix: config.typesPrefix,
+              suffix: config.typesSuffix,
+            }),
+          )
         : 'Record<string, never>';
       fields.push(
         `${fieldName}?: GraphCacheResolver<WithTypename<` +
-          `${convertName(parentType.name, {
-            prefix: config.typesPrefix,
-            suffix: config.typesSuffix,
-          })}>, ${argsName}, ` +
+          `${namespaced(
+            config,
+            convertName(parentType.name, {
+              prefix: config.typesPrefix,
+              suffix: config.typesSuffix,
+            }),
+          )}>, ${argsName}, ` +
           `${constructType(field.type, schema, convertName, config, false, true)}>`,
       );
 
@@ -198,10 +224,13 @@ function getRootUpdatersConfig(
       const updaters: string[] = [];
       Object.values(rootType.getFields()).forEach(field => {
         const argsName = field.args.length
-          ? convertName(`${rootType.name}${capitalize(field.name)}Args`, {
-              prefix: config.typesPrefix,
-              suffix: config.typesSuffix,
-            })
+          ? namespaced(
+              config,
+              convertName(`${rootType.name}${capitalize(field.name)}Args`, {
+                prefix: config.typesPrefix,
+                suffix: config.typesSuffix,
+              }),
+            )
           : 'Record<string, never>';
 
         updaters.push(
@@ -222,10 +251,13 @@ function getRootUpdatersConfig(
   const typeUpdateResolvers = getObjectTypes(schema).reduce((resolvers, parentType) => {
     const fields = Object.entries(parentType.getFields()).reduce((fields, [fieldName, field]) => {
       const argsName = field.args.length
-        ? convertName(`${parentType.name}${capitalize(fieldName)}Args`, {
-            prefix: config.typesPrefix,
-            suffix: config.typesSuffix,
-          })
+        ? namespaced(
+            config,
+            convertName(`${parentType.name}${capitalize(fieldName)}Args`, {
+              prefix: config.typesPrefix,
+              suffix: config.typesSuffix,
+            }),
+          )
         : 'Record<string, never>';
 
       fields.push(
@@ -427,7 +459,9 @@ function normalizeSelectionSet(
   schema: GraphQLSchema,
   baseTypeName: string,
 ): SelectionSetNode {
-  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const cleanTypeName = denamespaced(
+    baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, ''),
+  );
   const baseType = schema.getType(cleanTypeName);
 
   if (!baseType || !isObjectType(baseType)) {
@@ -500,7 +534,9 @@ function getSelectionSetKey(
       const fieldName = selection.name.value;
       if (selection.selectionSet) {
         // ネストした型名を取得
-        const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+        const cleanTypeName = denamespaced(
+          baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, ''),
+        );
         const baseType = schema.getType(cleanTypeName);
         let nestedTypeName = baseTypeName;
 
@@ -630,7 +666,9 @@ function buildOptimisticReturnType(
   const selectedFields: string[] = [];
 
   // 実際の型名を取得してリテラル型として使用
-  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const cleanTypeName = denamespaced(
+    baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, ''),
+  );
   const literalTypeName = cleanTypeName.split(/TypeSuffix|Suffix$/)[0].replace(/^Prefix/, ''); // prefixとsuffixを除去
 
   // GraphCacheでは常に__typenameが必要なので最初に追加（リテラル型として）
@@ -646,7 +684,9 @@ function buildOptimisticReturnType(
       }
 
       // フィールドの型情報を取得
-      const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+      const cleanTypeName = denamespaced(
+        baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, ''),
+      );
       const baseType = schema.getType(cleanTypeName);
       if (baseType && isObjectType(baseType)) {
         const field = baseType.getFields()[fieldName];
@@ -674,10 +714,13 @@ function buildOptimisticReturnType(
             }
 
             if (isObjectType(unwrappedType)) {
-              const nestedTypeName = convertName(unwrappedType.name, {
-                prefix: config.typesPrefix,
-                suffix: config.typesSuffix,
-              });
+              const nestedTypeName = namespaced(
+                config,
+                convertName(unwrappedType.name, {
+                  prefix: config.typesPrefix,
+                  suffix: config.typesSuffix,
+                }),
+              );
               const optimizedNestedType = buildOptimisticReturnType(
                 selection.selectionSet,
                 `WithTypename<${nestedTypeName}>`,
@@ -692,7 +735,7 @@ function buildOptimisticReturnType(
                 finalType = `Array<${finalType}>`;
               }
               if (isNullable) {
-                finalType = `Maybe<${finalType}>`;
+                finalType = `${namespaced(config, 'Maybe')}<${finalType}>`;
               }
 
               selectedFields.push(`${fieldName}: ${finalType}`);
@@ -742,7 +785,9 @@ function buildOptimisticReturnTypeWithInlineFragments(
   convertName: ConvertFn,
   config: UrqlGraphCacheConfig,
 ): string {
-  const cleanTypeName = baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, '');
+  const cleanTypeName = denamespaced(
+    baseTypeName.replace(/WithTypename<|>/g, '').replace(/Maybe<|>/g, ''),
+  );
   const baseType = schema.getType(cleanTypeName);
 
   if (!baseType || (!isInterfaceType(baseType) && !isUnionType(baseType))) {
@@ -895,10 +940,13 @@ function getOptimisticUpdatersConfig(
   // すべてのMutationフィールドを処理
   Object.values(mutationType.getFields()).forEach(field => {
     const argsName = field.args.length
-      ? convertName(`${capitalize(mutationType.name)}${capitalize(field.name)}Args`, {
-          prefix: config.typesPrefix,
-          suffix: config.typesSuffix,
-        })
+      ? namespaced(
+          config,
+          convertName(`${capitalize(mutationType.name)}${capitalize(field.name)}Args`, {
+            prefix: config.typesPrefix,
+            suffix: config.typesSuffix,
+          }),
+        )
       : 'Record<string, never>';
 
     let outputType = constructType(field.type, schema, convertName, config);
@@ -919,10 +967,13 @@ function getOptimisticUpdatersConfig(
           isInterfaceType(unwrappedType) ||
           isUnionType(unwrappedType)
         ) {
-          const baseTypeName = convertName(unwrappedType.name, {
-            prefix: config.typesPrefix,
-            suffix: config.typesSuffix,
-          });
+          const baseTypeName = namespaced(
+            config,
+            convertName(unwrappedType.name, {
+              prefix: config.typesPrefix,
+              suffix: config.typesSuffix,
+            }),
+          );
 
           const partialType = buildOptimisticUnionType(
             selection.selectionSets,
@@ -932,6 +983,8 @@ function getOptimisticUpdatersConfig(
             config,
           );
 
+          const maybe = namespaced(config, 'Maybe');
+
           // NonNullやListの包装を維持
           if (isNonNullType(field.type)) {
             if (isListType(field.type.ofType)) {
@@ -940,9 +993,9 @@ function getOptimisticUpdatersConfig(
               outputType = partialType;
             }
           } else if (isListType(field.type)) {
-            outputType = `Maybe<Array<${partialType}>>`;
+            outputType = `${maybe}<Array<${partialType}>>`;
           } else {
-            outputType = `Maybe<${partialType}>`;
+            outputType = `${maybe}<${partialType}>`;
           }
         }
       }
@@ -957,9 +1010,13 @@ function getOptimisticUpdatersConfig(
 }
 
 function getImports(config: UrqlGraphCacheConfig): string {
-  return `${config.useTypeImports ? 'import type' : 'import'} { ${
+  const graphcacheImport = `${config.useTypeImports ? 'import type' : 'import'} { ${
     config.offlineExchange ? 'offlineExchange' : 'cacheExchange'
   }, Resolver as GraphCacheResolver, UpdateResolver as GraphCacheUpdateResolver, OptimisticMutationResolver as GraphCacheOptimisticMutationResolver } from '@urql/exchange-graphcache';\n`;
+
+  if (!config.importSchemaTypesFrom) return graphcacheImport;
+
+  return `import type * as ${SCHEMA_TYPES_NAMESPACE} from '${config.importSchemaTypesFrom}';\n${graphcacheImport}`;
 }
 
 export const plugin: PluginFunction<UrqlGraphCacheConfig, Types.ComplexPluginOutput> = (
